@@ -3,7 +3,10 @@
   "version": "0.0.0",
   "license": "MIT",
   "description": "Dependency Injection Container with Sync + async resolution, Singleton + factory + instance, Hierarchical scoping and Lifecycle management",
-  "exports": {
-    "./mod.ts": "./mod.ts"
+  "exports": "./src/mod.ts",
+  "tasks": {
+    "lint": "deno lint",
+    "check": "deno check src/mod.ts",
+    "test": "deno test"
   }
 }
