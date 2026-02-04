@@ -1,5 +1,16 @@
 // deno-lint-ignore-file no-explicit-any
 
+/* ───────────────────────────────── Public Types ───────────────────────────── */
+
+export type ServiceDependencies = readonly string[];
+
+export interface ServiceFactory<T, Entries extends Record<string, unknown>> {
+  /** Factory function that receives the container and returns a service instance */
+  (container: Container<Entries>): T | Promise<T>;
+  /** Optional dependencies that this factory requires */
+  dependsOn?: ServiceDependencies;
+}
+
 export interface Disposable {
   dispose(): void | Promise<void>;
 }
@@ -7,13 +18,15 @@ export interface Disposable {
 export interface Container<Entries extends Record<string, unknown> = any> {
   // Registration
   register<T>(name: string, instance: T): void;
+
   registerFactory<T, E extends Entries = Entries>(
     name: string,
-    factory: (container: Container<E>) => T | Promise<T>,
+    factory: ServiceFactory<T, E>,
   ): void;
+
   registerSingleton<T, E extends Entries = Entries>(
     name: string,
-    factory: (container: Container<E>) => T | Promise<T>,
+    factory: ServiceFactory<T, E>,
   ): void;
 
   // Resolution
@@ -30,15 +43,7 @@ export interface Container<Entries extends Record<string, unknown> = any> {
   // Scoping
   createChild<ChildEntries extends Record<string, unknown> = Record<string, unknown>>(): Container<ChildEntries>;
 
-  /**
-   * Get the parent container, if any.
-   */
   getParent(): Container<Entries> | null;
-
-  /**
-   * Used when you want to resolve from the parent container if the service is not found in the current container.
-   * This is useful when you want to resolve a service from a parent container in a possible child container.
-   */
   getParentOrCurrent(): Container<Entries>;
 
   // Introspection
@@ -46,13 +51,14 @@ export interface Container<Entries extends Record<string, unknown> = any> {
   clear(): void;
 }
 
-type ServiceFactory<T, Entries extends Record<string, unknown>> = (container: Container<Entries>) => T | Promise<T>;
+/* ───────────────────────────────── Internal Types ───────────────────────────── */
 
-interface ServiceRegistration<T> {
-  type: "instance" | "factory" | "singleton";
-  value: T | ServiceFactory<T, any>;
-  singleton?: T;
-}
+type ServiceRegistration<T> =
+  | { type: "instance"; value: T }
+  | { type: "factory"; value: ServiceFactory<T, any> }
+  | { type: "singleton"; value: ServiceFactory<T, any>; singleton?: T };
+
+/* ───────────────────────────────── Container ───────────────────────────── */
 
 export class DIContainer<Entries extends Record<string, unknown> = Record<string, unknown>>
   implements Container<Entries> {
@@ -83,10 +89,15 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
     name: string,
     factory: ServiceFactory<T, E>,
   ): void {
-    if (factory.toString().includes("tenant")) {
-      console.warn(`[DI] Singleton '${name}' depends on tenant — this is unsafe.`);
-    }
     this.assertAlive();
+
+    // Explicit dependency intent warning
+    if (factory?.dependsOn && factory.dependsOn.length > 0) {
+      console.warn(
+        `[${this.constructor.name}] Singleton '${name}' depends on ${factory.dependsOn.join(", ")} — this is unsafe.`,
+      );
+    }
+
     this.services.set(name, { type: "singleton", value: factory });
   }
 
@@ -105,11 +116,11 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
     }
 
     if (reg.type === "factory") {
-      const result = (reg.value as ServiceFactory<R, Entries>)(this);
+      const result = reg.value(this as Container<any>);
       if (result instanceof Promise) {
         throw new Error(`Service '${String(name)}' is async. Use resolveAsync().`);
       }
-      return result;
+      return result as R;
     }
 
     // singleton
@@ -117,13 +128,20 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
       return reg.singleton as R;
     }
 
-    const result = (reg.value as ServiceFactory<R, Entries>)(this);
+    // Warn if singleton is resolved from a child container
+    if (this.parent) {
+      console.warn(
+        `[${this.constructor.name}] Singleton '${String(name)}' is being resolved from a child container. This may capture scoped dependencies.`,
+      );
+    }
+
+    const result = reg.value(this as Container<any>);
     if (result instanceof Promise) {
       throw new Error(`Service '${String(name)}' is async. Use resolveAsync().`);
     }
 
     reg.singleton = result;
-    return result;
+    return result as R;
   }
 
   async resolveAsync<T, K extends keyof Entries = keyof Entries>(
@@ -141,9 +159,7 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
     }
 
     if (reg.type === "factory") {
-      return await Promise.resolve(
-        (reg.value as ServiceFactory<R, Entries>)(this),
-      );
+      return await Promise.resolve(reg.value(this as Container<any>)) as R;
     }
 
     // singleton
@@ -151,12 +167,15 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
       return reg.singleton as R;
     }
 
-    const result = await Promise.resolve(
-      (reg.value as ServiceFactory<R, Entries>)(this),
-    );
+    if (this.parent) {
+      console.warn(
+        `[${this.constructor.name}] Singleton '${String(name)}' is being resolved from a child container. This may capture scoped dependencies.`,
+      );
+    }
 
+    const result = await Promise.resolve(reg.value(this as Container<any>));
     reg.singleton = result;
-    return result;
+    return result as R;
   }
 
   /* ───────────────────────────────── Scoping ───────────────────────────── */
@@ -202,9 +221,11 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
     this.disposed = true;
 
     for (const reg of this.services.values()) {
-      const value = reg.singleton ?? reg.value;
-      if (typeof value === "object" && value && "dispose" in value) {
-        await (value as Disposable).dispose();
+      if (reg.type === "singleton" && reg.singleton) {
+        const value = reg.singleton;
+        if (typeof value === "object" && value && "dispose" in value) {
+          await (value as Disposable).dispose();
+        }
       }
     }
 
@@ -223,7 +244,7 @@ export class DIContainer<Entries extends Record<string, unknown> = Record<string
     return this.parent?.getRegistrationDeep(name) ?? null;
   }
 
-  private assertAlive() {
+  private assertAlive(): void {
     if (this.disposed) {
       throw new Error("Container has been disposed");
     }

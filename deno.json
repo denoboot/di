@@ -1,6 +1,7 @@
 {
   "name": "@denoboot/di",
   "version": "0.0.0",
+  "license": "MIT",
   "description": "Dependency Injection Container with Sync + async resolution, Singleton + factory + instance, Hierarchical scoping and Lifecycle management",
   "exports": {
     "./mod.ts": "./mod.ts"
